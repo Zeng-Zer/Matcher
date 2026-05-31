@@ -911,6 +911,10 @@ public final class ClassInstance implements ParentInstance, Matchable<ClassInsta
 				&& (matchedClass == null || matchedClass.mappedName == null);
 	}
 
+	public boolean hasOwnMappedName() {
+		return mappedName != null;
+	}
+
 	public void setMappedName(String mappedName) {
 		assert mappedName == null || !hasOuterName(mappedName);
 

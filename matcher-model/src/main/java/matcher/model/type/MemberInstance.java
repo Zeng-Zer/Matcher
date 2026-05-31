@@ -256,6 +256,10 @@ public abstract class MemberInstance<T extends MemberInstance<T>> implements Mat
 		return getMappedName() != null;
 	}
 
+	public boolean hasOwnMappedName() {
+		return hierarchyData != null && hierarchyData.mappedName != null;
+	}
+
 	private String getMappedName() {
 		assert hierarchyData != null; // only available for input classes
 

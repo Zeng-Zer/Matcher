@@ -20,4 +20,11 @@ public class BuiltinCliParameters {
 	public static final String OUTPUT_FILE = "--output-file";
 	public static final String DONT_SAVE_UNMAPPED_MATCHES = "--dont-save-unmapped-matches";
 	public static final String PASSES = "--passes";
+	public static final String CLASS_BY_CLASS = "--class-by-class";
+	public static final String CLASS_BY_CLASS_TIMEOUT = "--class-by-class-timeout";
+	public static final String CLASS_BY_CLASS_LEVEL = "--class-by-class-level";
+	public static final String OUTPUT_MAPPING = "--output-mapping";
+	public static final String FROM_MAPPING = "--from-mapping";
+	public static final String LOAD_MATCH = "--load-match";
+	public static final String LIST_UNMATCHED_MAPPED = "--list-unmatched-mapped";
 }

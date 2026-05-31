@@ -27,6 +27,10 @@ public class MatchingMenu extends Menu {
 
 		getItems().add(new SeparatorMenuItem());
 
+		menuItem = new MenuItem("Auto class match, mapping only");
+		getItems().add(menuItem);
+		menuItem.setOnAction(event -> autoMatchClassesFromMapping());
+
 		menuItem = new MenuItem("Auto class match");
 		getItems().add(menuItem);
 		menuItem.setOnAction(event -> autoMatchClasses());
@@ -58,6 +62,18 @@ public class MatchingMenu extends Menu {
 		gui.runProgressTask(
 				"Auto matching...",
 				gui.getMatcher()::autoMatchAll,
+				() -> gui.onMatchChange(EnumSet.allOf(MatchType.class)),
+				Throwable::printStackTrace);
+	}
+
+	public void autoMatchClassesFromMapping() {
+		gui.runProgressTask(
+				"Auto matching from mapping...",
+				progressReceiver -> {
+					gui.getMatcher().autoMatchClassesFromMapping(progressReceiver);
+					gui.getMatcher().autoMatchMethodsFromMapping(progressReceiver);
+					gui.getMatcher().autoMatchFieldsFromMapping(progressReceiver);
+				},
 				() -> gui.onMatchChange(EnumSet.allOf(MatchType.class)),
 				Throwable::printStackTrace);
 	}

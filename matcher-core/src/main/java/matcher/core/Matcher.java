@@ -2,6 +2,7 @@ package matcher.core;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.List;
@@ -13,6 +14,9 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import java.util.function.DoubleConsumer;
@@ -451,15 +455,8 @@ public class Matcher {
 		}
 
 		autoMatchLevel(ClassifierLevel.Intermediate, progressReceiver);
-		autoMatchLevel(ClassifierLevel.Full, progressReceiver);
-		autoMatchLevel(ClassifierLevel.Extra, progressReceiver);
-
-		boolean matchedAny;
-
-		do {
-			matchedAny = autoMatchMethodArgs(ClassifierLevel.Full, absMethodArgAutoMatchThreshold, relMethodArgAutoMatchThreshold, progressReceiver);
-			matchedAny |= autoMatchMethodVars(ClassifierLevel.Full, absMethodVarAutoMatchThreshold, relMethodVarAutoMatchThreshold, progressReceiver);
-		} while (matchedAny);
+		// autoMatchLevel(ClassifierLevel.Full, progressReceiver);
+		// autoMatchLevel(ClassifierLevel.Extra, progressReceiver);
 
 		env.getCache().clear();
 	}
@@ -467,8 +464,11 @@ public class Matcher {
 	private void autoMatchLevel(ClassifierLevel level, DoubleConsumer progressReceiver) {
 		boolean matchedAny;
 		boolean matchedClassesBefore = true;
+		int iteration = 0;
+		final int maxIterations = 4;
 
 		do {
+			iteration++;
 			matchedAny = autoMatchMethods(level, absMethodAutoMatchThreshold, relMethodAutoMatchThreshold, progressReceiver);
 			matchedAny |= autoMatchFields(level, absFieldAutoMatchThreshold, relFieldAutoMatchThreshold, progressReceiver);
 
@@ -477,6 +477,11 @@ public class Matcher {
 			}
 
 			matchedAny |= matchedClassesBefore = autoMatchClasses(level, absClassAutoMatchThreshold, relClassAutoMatchThreshold, progressReceiver);
+
+			if (iteration >= maxIterations) {
+				LOGGER.info("Stopping after {} iterations (reached maximum)", maxIterations);
+				break;
+			}
 		} while (matchedAny);
 	}
 
@@ -508,7 +513,7 @@ public class Matcher {
 
 				matches.put(cls, match);
 			}
-		}, progressReceiver);
+		}, progressReceiver, 300000);
 
 		sanitizeMatches(matches);
 
@@ -522,14 +527,31 @@ public class Matcher {
 	}
 
 	public static <T, C> void runInParallel(List<T> workSet, Consumer<T> worker, DoubleConsumer progressReceiver) {
+		runInParallel(workSet, worker, progressReceiver, 0);
+	}
+
+	public static <T, C> void runInParallel(List<T> workSet, Consumer<T> worker, DoubleConsumer progressReceiver, long timeoutMs) {
 		if (workSet.isEmpty()) return;
 
 		AtomicInteger itemsDone = new AtomicInteger();
+		AtomicInteger itemsTimedOut = new AtomicInteger();
 		int updateRate = Math.max(1, workSet.size() / 200);
 
 		try {
 			List<Future<Void>> futures = threadPool.invokeAll(workSet.stream().<Callable<Void>>map(workItem -> () -> {
-				worker.accept(workItem);
+				if (timeoutMs > 0) {
+					CompletableFuture<Void> future = CompletableFuture.runAsync(() -> worker.accept(workItem), threadPool);
+
+					try {
+						future.get(timeoutMs, TimeUnit.MILLISECONDS);
+					} catch (TimeoutException e) {
+						future.cancel(true);
+						itemsTimedOut.incrementAndGet();
+						LOGGER.debug("Task timed out after {} ms", timeoutMs);
+					}
+				} else {
+					worker.accept(workItem);
+				}
 
 				int cItemsDone = itemsDone.incrementAndGet();
 
@@ -542,6 +564,12 @@ public class Matcher {
 
 			for (Future<Void> future : futures) {
 				future.get();
+			}
+
+			int timedOut = itemsTimedOut.get();
+
+			if (timedOut > 0) {
+				LOGGER.warn("{} tasks timed out and were skipped", timedOut);
 			}
 		} catch (ExecutionException | InterruptedException e) {
 			throw new RuntimeException(e);
@@ -584,7 +612,135 @@ public class Matcher {
 		}
 
 		LOGGER.info("Auto matched {} fields ({} unmatched)", matches.size(), totalUnmatched.get());
+		return !matches.isEmpty();
+	}
 
+	public boolean autoMatchClassesFromMapping(DoubleConsumer progressReceiver) {
+		return autoMatchClassesFromMapping(autoMatchLevel, absClassAutoMatchThreshold, relClassAutoMatchThreshold, progressReceiver);
+	}
+
+	public boolean autoMatchClassesFromMapping(ClassifierLevel level, double absThreshold, double relThreshold, DoubleConsumer progressReceiver) {
+		boolean assumeBothOrNoneObfuscated = env.assumeBothOrNoneObfuscated;
+
+		// Filter for side A: only classes with mapped names from mapping file
+		Predicate<ClassInstance> filterA = cls -> cls.isReal() && cls.hasOwnMappedName() && !cls.hasMatch() && cls.isMatchable();
+
+		// Filter for side B: standard filter (obfuscated or matchable, no existing match)
+		Predicate<ClassInstance> filterB = cls -> cls.isReal() && (!assumeBothOrNoneObfuscated || cls.isNameObfuscated()) && !cls.hasMatch() && cls.isMatchable();
+
+		List<ClassInstance> classes = env.getClassesA().stream()
+				.filter(filterA)
+				.collect(Collectors.toList());
+
+		ClassInstance[] cmpClasses = env.getClassesB().stream()
+				.filter(filterB)
+				.collect(Collectors.toList()).toArray(new ClassInstance[0]);
+
+		if (classes.isEmpty()) {
+			LOGGER.info("No classes with mapped names found to match");
+			return false;
+		}
+
+		double maxScore = ClassClassifier.getMaxScore(level);
+		double maxMismatch = maxScore - ClassifierUtil.getRawScore(absThreshold * (1 - relThreshold), maxScore);
+		Map<ClassInstance, ClassInstance> matches = new ConcurrentHashMap<>(classes.size());
+
+		long timeoutPerClassMs = 300000; // 5 minutes timeout per class
+
+		runInParallel(classes, cls -> {
+			List<RankResult<ClassInstance>> ranking = ClassClassifier.rank(cls, cmpClasses, level, env, maxMismatch);
+
+			if (ClassifierUtil.checkRank(ranking, absThreshold, relThreshold, maxScore)) {
+				ClassInstance match = ranking.get(0).getSubject();
+
+				matches.put(cls, match);
+			}
+		}, progressReceiver, timeoutPerClassMs);
+
+		sanitizeMatches(matches);
+
+		for (Map.Entry<ClassInstance, ClassInstance> entry : matches.entrySet()) {
+			match(entry.getKey(), entry.getValue());
+		}
+
+		LOGGER.info("Auto matched {} classes from mapping ({} unmatched, {} total with mapped names)", matches.size(), (classes.size() - matches.size()), classes.size());
+
+		return !matches.isEmpty();
+	}
+
+	public boolean autoMatchMethodsFromMapping(DoubleConsumer progressReceiver) {
+		return autoMatchMethodsFromMapping(autoMatchLevel, absMethodAutoMatchThreshold, relMethodAutoMatchThreshold, progressReceiver);
+	}
+
+	public boolean autoMatchMethodsFromMapping(ClassifierLevel level, double absThreshold, double relThreshold, DoubleConsumer progressReceiver) {
+		boolean assumeBothOrNoneObfuscated = env.assumeBothOrNoneObfuscated;
+
+		// Filter for side A: only methods with mapped names from mapping file
+		Predicate<ClassInstance> classFilter = cls -> cls.isReal() && cls.hasMatch();
+
+		List<ClassInstance> classes = env.getClassesA().stream()
+				.filter(classFilter)
+				.collect(Collectors.toList());
+
+		AtomicInteger totalUnmatched = new AtomicInteger();
+		double maxScore = MethodClassifier.getMaxScore(level);
+		Map<MethodInstance, MethodInstance> matches = match(level, absThreshold, relThreshold,
+				cls -> {
+					List<MethodInstance> methods = new ArrayList<>();
+					for (MethodInstance m : cls.getMethods()) {
+						if (m.hasOwnMappedName() && !m.hasMatch() && m.isMatchable()) {
+							methods.add(m);
+						}
+					}
+					return methods.toArray(new MethodInstance[0]);
+				},
+				MethodClassifier::rank, maxScore,
+				progressReceiver, totalUnmatched);
+
+		for (Map.Entry<MethodInstance, MethodInstance> entry : matches.entrySet()) {
+			match(entry.getKey(), entry.getValue());
+		}
+
+		LOGGER.info("Auto matched {} methods from mapping ({} unmatched)", matches.size(), totalUnmatched.get());
+
+		return !matches.isEmpty();
+	}
+
+	public boolean autoMatchFieldsFromMapping(DoubleConsumer progressReceiver) {
+		return autoMatchFieldsFromMapping(autoMatchLevel, absFieldAutoMatchThreshold, relFieldAutoMatchThreshold, progressReceiver);
+	}
+
+	public boolean autoMatchFieldsFromMapping(ClassifierLevel level, double absThreshold, double relThreshold, DoubleConsumer progressReceiver) {
+		boolean assumeBothOrNoneObfuscated = env.assumeBothOrNoneObfuscated;
+
+		// Filter for side A: only fields with mapped names from mapping file
+		Predicate<ClassInstance> classFilter = cls -> cls.isReal() && cls.hasMatch();
+
+		List<ClassInstance> classes = env.getClassesA().stream()
+				.filter(classFilter)
+				.collect(Collectors.toList());
+
+		AtomicInteger totalUnmatched = new AtomicInteger();
+		double maxScore = FieldClassifier.getMaxScore(level);
+
+		Map<FieldInstance, FieldInstance> matches = match(level, absThreshold, relThreshold,
+				cls -> {
+					List<FieldInstance> fields = new ArrayList<>();
+					for (FieldInstance f : cls.getFields()) {
+						if (f.hasOwnMappedName() && !f.hasMatch() && f.isMatchable()) {
+							fields.add(f);
+						}
+					}
+					return fields.toArray(new FieldInstance[0]);
+				},
+				FieldClassifier::rank, maxScore,
+				progressReceiver, totalUnmatched);
+
+		for (Map.Entry<FieldInstance, FieldInstance> entry : matches.entrySet()) {
+			match(entry.getKey(), entry.getValue());
+		}
+
+		LOGGER.info("Auto matched {} fields from mapping ({} unmatched)", matches.size(), totalUnmatched.get());
 		return !matches.isEmpty();
 	}
 
